@@ -1,5 +1,5 @@
-// Pump.fun paper-trading strategy: breakout + pullback entries, overhang filter,
-// graduation-proximity momentum, multi-tranche exits with trailing stops.
+// Pump.fun paper-trading strategy: pullback dip-bounces + graduation chase,
+// overhang filter, multi-tranche exits with trailing stops, free re-trading.
 //
 // Design (written from scratch for this bounty):
 // - Every coin is tracked from its TradeEvents: price from virtual reserves,
@@ -7,22 +7,27 @@
 //   running high/low since first sight. No per-coin memory across runs and no
 //   tuned-to-one-window constants: thresholds are coarse on purpose so the bot
 //   survives a fresh 6h window it has never seen.
-// - Entries: (A) breakout above a settled window high, but only while the
-//   move is still happening (price up >=8% over the last ~800 slots), (B)
-//   pullback re-entry after a >=12% dip off a high that itself sits >=50%
-//   above the low, once the dip starts bouncing, and (C) graduation chase
-//   when real SOL reserves approach migration with the price holding near
-//   its high. Coins with heavy seller overhang in the recent window, dead
-//   coins (down >50% from high, still falling), and thin coins (too few
-//   trades / too little real reserve to take a >=0.02 SOL order under the
+// - Entries: (B) pullback re-entry after a >=10% dip off a recent high that
+//   itself sits >=35% above the windowed low, once the dip starts bouncing,
+//   and (C) graduation chase when real SOL reserves approach migration with
+//   the price holding near its high. Breakout-chasing was tried and ablated
+//   out (it bought stale tops: -0.35 SOL with breakouts vs -0.07 without).
+//   Coins with heavy seller overhang in the recent window, dead coins (down
+//   >50% from high, still falling), and thin coins (too few trades / too
+//   little real reserve to take a >=0.02 SOL order under the
 //   100 bps-of-real-reserve cap) are skipped.
-// - Exits are mechanical per position: sell half at +15%, sell the rest at
-//   +40% or on a trailing stop (10% off the peak once the peak was +8%),
-//   hard stop at -12%, stale exit after ~6000 slots without profit.
-//   A mint that stops the bot out is banned for a while, so dead coins
-//   cannot be churned.
+// - Exits are mechanical per position: sell half at +18%, sell the rest at
+//   +100% or on a trailing stop (15% off the peak once the peak was +10%),
+//   hard stop at -7%, stale exit after ~4000 slots without profit. A
+//   winning position may take one pyramid add while it makes fresh highs.
+// - Coins run in waves, so the bot re-trades them freely: only a brief
+//   pause (200-2000 slots) after a stop or a stale exit, and a 200-slot
+//   gap between buys of the same mint.
 // - After a stop-loss the bot halves its size and pauses new entries briefly
 //   (post-loss risk scaling). At most 5 open positions, at most 2 new buys
+//   per batch, at most 16 orders per batch.
+// - Fully deterministic: every decision comes from the slot number and the
+//   events in the batch stream. No clock, no environment, no randomness.
 //   per batch, at most 16 orders per batch.
 // - Fully deterministic: every decision comes from the slot number and the
 //   events in the batch stream. No clock, no environment, no randomness.

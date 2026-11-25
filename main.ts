@@ -3,6 +3,11 @@
 // each batch message carries the slot, the events, the marks and the fills;
 // the reply to each batch carries the orders decided on that slot. All
 // trading logic lives in strategy.ts; this file only wires the SDK shim to it.
+//
+// Determinism contract: the harness runs this program twice and the two
+// action logs must match byte for byte, so nothing here (or in strategy.ts)
+// reads the clock, the environment, or unseeded randomness — every decision
+// is a pure function of the hello and the batch stream.
 
 import { runBot } from "./vendor/makefun-bot.ts";
 import { PumpStrategy } from "./strategy.ts";
