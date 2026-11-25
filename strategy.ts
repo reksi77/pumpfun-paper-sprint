@@ -42,27 +42,28 @@ const LAMPORTS_PER_SOL = 1_000_000_000n;
 const BASE_BUY_SOL = 0.2; // SOL per first tranche
 const ADD_BUY_SOL = 0.1; // SOL for a pullback add-on tranche
 const MIN_BUY_SOL = 0.02; // never buy less (keeps round trips >= 0.01 SOL)
-const MIN_TRADES = 20; // activity floor before a coin is tradable
+const MIN_TRADES = 40; // activity floor before a coin is tradable
 const MIN_REAL_SOL = 5; // SOL of real reserves before a coin is tradable
 const WIN_SLOTS = 3000; // recent window for velocity / overhang (~10 min)
-const MIN_WIN_TRADES = 8; // trades inside the recent window
+const MIN_WIN_TRADES = 10; // trades inside the recent window
 const VELOCITY_SLOTS = 800; // lookback for the velocity check
 const BREAKOUT_RUN = 1.2; // windowed high must sit >=20% above windowed low
-const BREAKOUT_VELOCITY = 0.08; // price must be up >=8% over VELOCITY_SLOTS
-const PULLBACK_MIN_RUN = 1.5; // pullback coins must have run >=50% first
-const PULLBACK_DIP_MIN = 0.88; // price <= 88% of the high (a real dip)
-const PULLBACK_DIP_MAX = 0.7; // but not collapsed below 70% of the high
-const PULLBACK_BOUNCE = 1.04; // and ticking back up >=4% off the dip low
+const BREAKOUT_VELOCITY = 0.12; // price must be up >=12% over VELOCITY_SLOTS
+const PULLBACK_MIN_RUN = 1.35; // pullback coins must have run >=35% first
+const PULLBACK_DIP_MIN = 0.9; // price <= 90% of the high (a real dip)
+const PULLBACK_DIP_MAX = 0.68; // but not collapsed below 68% of the high
+const PULLBACK_BOUNCE = 1.03; // and ticking back up >=3% off the dip low
+const PULLBACK_HIGH_RECENCY = 1500; // the high must have been set recently
 const GRAD_REAL_SOL = 45; // graduation chase starts at 45 SOL real reserves
-const PARTIAL_AT = 0.15; // sell half at +15%
-const RUNNER_AT = 0.4; // sell the rest at +40%
-const HARD_STOP = -0.12; // sell all at -12%
-const TRAIL_FROM_PEAK = 0.9; // trailing stop: 10% below the position peak
-const TRAIL_ARM_AT = 0.08; // trailing stop arms once the peak is +8%
-const STALE_SLOTS = 6000; // exit a flat position after this many slots
+const PARTIAL_AT = 0.18; // sell half at +18%
+const RUNNER_AT = 1.0; // sell the rest at +100% (rare; the trail usually exits first)
+const HARD_STOP = -0.07; // sell all at -7%: cut losers short, let winners run
+const TRAIL_FROM_PEAK = 0.85; // trailing stop: 15% below the position peak
+const TRAIL_ARM_AT = 0.1; // trailing stop arms once the peak is +10%
+const STALE_SLOTS = 4000; // exit a flat position after this many slots
 const LOSS_COOLDOWN_SLOTS = 500; // pause new entries briefly after a stop
 const LOSS_SIZE_SCALE = 0.5; // smaller size while a recent loss is open
-const REBUY_GAP_SLOTS = 500; // don't re-buy the same mint too soon
+const REBUY_GAP_SLOTS = 1000; // don't re-buy the same mint too soon
 const BAN_AFTER_STOP_SLOTS = 20000; // don't re-enter a mint that stopped us out
 const BAN_AFTER_STALE_SLOTS = 5000; // don't re-enter a mint exited as stale
 const MAX_NEW_BUYS_PER_BATCH = 2;
@@ -255,7 +256,7 @@ export class PumpStrategy {
         if (gain > 0) this.noteWin();
         continue;
       }
-      // First partial lock at +30%.
+      // First partial lock at +18%.
       if (!pos.partialTaken && gain >= PARTIAL_AT) {
         const half = tokens / 2n;
         if (half > 0n) {
@@ -311,6 +312,7 @@ export class PumpStrategy {
     let winSell = 0;
     let lastBuys = 0;
     let winHighPrev = 0;
+    let winHighSlot = 0;
     let winLow = Infinity;
     let velPrice = 0;
     let velSlot = 0;
@@ -321,7 +323,10 @@ export class PumpStrategy {
       if (t.buy) winBuy += t.sol;
       else winSell += t.sol;
       if (i < n - 1) {
-        if (t.price > winHighPrev) winHighPrev = t.price;
+        if (t.price > winHighPrev) {
+          winHighPrev = t.price;
+          winHighSlot = t.slot;
+        }
       }
       if (t.price < winLow) winLow = t.price;
       if (i >= n - 3 && t.buy) lastBuys += 1;
@@ -344,24 +349,6 @@ export class PumpStrategy {
     const sizeScale = this.recentLossOpen ? LOSS_SIZE_SCALE : 1;
     const freeCash = state.freeCashLamports();
 
-    // Add-on tranche on a held position: pullback add while still near cost.
-    if (held) {
-      const pos = this.positions.get(c.mint);
-      if (!pos || pos.addedTranche) return null;
-      const costPerToken = Number(held.cost_lamports) / Number(held.token_amount);
-      const gain = price / costPerToken - 1;
-      if (gain > 0.1 || gain < -0.1) return null;
-      if (price > winHighPrev * 0.9 || price < c.dipLow * 1.02) return null;
-      const sized = this.sizedBuy(state, c.mint, ADD_BUY_SOL * sizeScale, freeCash);
-      if (!sized) return null;
-      pos.addedTranche = true;
-      return sized;
-    }
-
-    // Fresh entry: don't churn the same mint.
-    const lastBuy = this.lastBuySlot.get(c.mint);
-    if (lastBuy !== undefined && slot - lastBuy < REBUY_GAP_SLOTS) return null;
-
     // Velocity: the move must be happening NOW. If the ring does not reach
     // back VELOCITY_SLOTS, fall back to the oldest ring trade we have.
     if (velPrice === 0) {
@@ -380,6 +367,26 @@ export class PumpStrategy {
     }
     const bounced = price >= dipLowAfterHigh * PULLBACK_BOUNCE;
 
+    // Add-on tranche: pyramid into a WINNER only — a held position up
+    // 12-35% that is making a fresh windowed high with velocity still
+    // positive. Never average down, never add to a flat position.
+    if (held) {
+      const pos = this.positions.get(c.mint);
+      if (!pos || pos.addedTranche) return null;
+      const costPerToken = Number(held.cost_lamports) / Number(held.token_amount);
+      const gain = price / costPerToken - 1;
+      if (gain < 0.12 || gain > 0.35) return null;
+      if (price <= winHighPrev || velocity < 0.03) return null;
+      const sized = this.sizedBuy(state, c.mint, ADD_BUY_SOL * sizeScale, freeCash);
+      if (!sized) return null;
+      pos.addedTranche = true;
+      return sized;
+    }
+
+    // Fresh entry: don't churn the same mint.
+    const lastBuy = this.lastBuySlot.get(c.mint);
+    if (lastBuy !== undefined && slot - lastBuy < REBUY_GAP_SLOTS) return null;
+
     // (C) Graduation chase: deep real reserves, price holding near its high.
     const gradChase =
       Number(curve.real_quote_reserves) >= GRAD_REAL_SOL * 1e9 &&
@@ -397,13 +404,18 @@ export class PumpStrategy {
     // (B) Pullback: ran up, dipped 12-30% off the high, now bouncing.
     const pullback =
       runFromLow >= PULLBACK_MIN_RUN &&
+      slot - winHighSlot <= PULLBACK_HIGH_RECENCY &&
       price <= winHighPrev * PULLBACK_DIP_MIN &&
       price >= winHighPrev * PULLBACK_DIP_MAX &&
       bounced &&
       lastBuys >= 1 &&
-      winBuy >= winSell * 0.8;
+      winBuy >= winSell * 1.2;
+    // Breakout entries stay disabled: ablations showed breakouts drag
+    // (v3b -0.35 SOL with them, v3d -0.07 SOL without), while pullback
+    // dip-bounces carry the edge. Only pullback + graduation chase enter.
+    const breakoutOff = false;
 
-    if (!gradChase && !breakout && !pullback) return null;
+    if (!gradChase && !breakoutOff && !pullback) return null;
 
     const want = (gradChase ? BASE_BUY_SOL * 1.25 : BASE_BUY_SOL) * sizeScale;
     const sized = this.sizedBuy(state, c.mint, want, freeCash);
